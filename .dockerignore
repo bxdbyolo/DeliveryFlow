@@ -1,0 +1,7 @@
+.git
+.idea
+.env
+**/bin
+**/obj
+**/TestResults
+DeliveryFlow.Tests

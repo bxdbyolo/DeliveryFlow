@@ -1,0 +1,40 @@
+services:
+  db:
+    image: postgres:18
+
+    environment:
+      POSTGRES_USER: deliveryflow
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: deliveryflow
+
+    ports:
+      - "127.0.0.1:5434:5432"
+
+    volumes:
+      - postgres_data:/var/lib/postgresql
+
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U deliveryflow -d deliveryflow"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+
+    ports:
+      - "127.0.0.1:8080:8080"
+
+    environment:
+      ASPNETCORE_ENVIRONMENT: Development
+      ApplyMigrations: "true"
+      ConnectionStrings__DeliveryFlow: "Host=db;Port=5432;Database=deliveryflow;Username=deliveryflow;Password=${POSTGRES_PASSWORD}"
+
+    depends_on:
+      db:
+        condition: service_healthy
+
+volumes:
+  postgres_data:

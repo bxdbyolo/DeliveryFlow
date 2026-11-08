@@ -1,0 +1,553 @@
+# =============================================================================
+# DeliveryFlow API | JetBrains Rider HTTP Client
+# =============================================================================
+# Base URL for Docker Compose. For a local Rider launch, change to :5034
+# (or the port shown in your launchSettings.json).
+#
+# How to use:
+#   1. Start the API: docker compose up -d --build
+#   2. Run requests from top to bottom, or use "Run All Requests in File".
+#   3. Creation responses save IDs in Rider's client.global variables.
+#      Later requests use those IDs automatically.
+#
+# Sections:
+#   00 — Read-only requests
+#   01 — Full delivery lifecycle
+#   02 — Cancellation and invalid transitions
+#   03 — Busy courier and reuse after delivery
+#   04 — Invalid input and missing resources
+#
+# NOTE: Requests create real rows in the local development database.
+#       Rerunning the file creates new rows. There is no cleanup endpoint.
+#       The file contains no passwords or access tokens.
+# =============================================================================
+
+@baseUrl = http://localhost:8080
+@missingOrderId = 00000000-0000-4000-8000-000000000001
+@missingCourierId = 00000000-0000-4000-8000-000000000002
+
+
+# =============================================================================
+# 00 | READ-ONLY REQUESTS
+# =============================================================================
+
+### 00.1 List orders
+GET {{baseUrl}}/api/orders
+Accept: application/json
+
+> {%
+    client.test("List orders: 200 OK", function () {
+        client.assert(response.status === 200, "Expected HTTP 200");
+        client.assert(Array.isArray(response.body), "Expected a JSON array");
+    });
+%}
+
+### 00.2 List couriers
+GET {{baseUrl}}/api/couriers
+Accept: application/json
+
+> {%
+    client.test("List couriers: 200 OK", function () {
+        client.assert(response.status === 200, "Expected HTTP 200");
+        client.assert(Array.isArray(response.body), "Expected a JSON array");
+    });
+%}
+
+
+# =============================================================================
+# 01 | HAPPY PATH: CREATED -> ASSIGNED -> IN DELIVERY -> DELIVERED
+# =============================================================================
+
+### 01.1 Create order (saves {{orderId}})
+POST {{baseUrl}}/api/orders
+Content-Type: application/json
+Accept: application/json
+
+{
+  "description": "DeliveryFlow: full lifecycle",
+  "price": 2500.00
+}
+
+> {%
+    client.test("Create order: 201 Created", function () {
+        client.assert(response.status === 201, "Expected HTTP 201");
+        client.assert(!!response.body.id, "Response must include order id");
+    });
+    if (response.status === 201 && response.body.id) {
+        client.global.set("orderId", response.body.id);
+    }
+%}
+
+### 01.2 Get created order
+GET {{baseUrl}}/api/orders/{{orderId}}
+Accept: application/json
+
+> {%
+    client.test("Get order: 200 OK", function () {
+        client.assert(response.status === 200, "Expected HTTP 200");
+        client.assert(response.body.id === client.global.get("orderId"), "Unexpected order id");
+    });
+%}
+
+### 01.3 Create courier (saves {{courierId}})
+POST {{baseUrl}}/api/couriers
+Content-Type: application/json
+Accept: application/json
+
+{
+  "name": "Alex"
+}
+
+> {%
+    // Accept 200 or 201: depends on the current CourierController implementation.
+    client.test("Create courier: successful response", function () {
+        client.assert(response.status === 200 || response.status === 201, "Expected HTTP 200 or 201");
+        client.assert(!!response.body.id, "Response must include courier id");
+    });
+    if ((response.status === 200 || response.status === 201) && response.body.id) {
+        client.global.set("courierId", response.body.id);
+    }
+%}
+
+### 01.4 Assign courier to order
+POST {{baseUrl}}/api/orders/{{orderId}}/assign
+Content-Type: application/json
+Accept: application/json
+
+{
+  "courierId": "{{courierId}}"
+}
+
+> {%
+    client.test("Assign courier: 200 OK", function () {
+        client.assert(response.status === 200, "Expected HTTP 200");
+    });
+%}
+
+### 01.5 Start delivery
+POST {{baseUrl}}/api/orders/{{orderId}}/start-delivery
+Accept: application/json
+
+> {%
+    client.test("Start delivery: 200 OK", function () {
+        client.assert(response.status === 200, "Expected HTTP 200");
+    });
+%}
+
+### 01.6 Complete delivery (courier becomes available)
+POST {{baseUrl}}/api/orders/{{orderId}}/complete-delivery
+Accept: application/json
+
+> {%
+    client.test("Complete delivery: 200 OK", function () {
+        client.assert(response.status === 200, "Expected HTTP 200");
+    });
+%}
+
+### 01.7 Get delivered order
+GET {{baseUrl}}/api/orders/{{orderId}}
+Accept: application/json
+
+> {%
+    client.test("Delivered order can be fetched", function () {
+        client.assert(response.status === 200, "Expected HTTP 200");
+        client.assert(response.body.courierId === client.global.get("courierId"), "Courier link must be preserved");
+    });
+%}
+
+### 01.8 Inspect couriers after delivery
+GET {{baseUrl}}/api/couriers
+Accept: application/json
+
+> {%
+    client.test("Couriers list: 200 OK", function () {
+        client.assert(response.status === 200, "Expected HTTP 200");
+    });
+%}
+
+
+### 01.9 Cannot complete an already delivered order
+POST {{baseUrl}}/api/orders/{{orderId}}/complete-delivery
+Accept: application/json
+
+> {%
+    client.test("Complete already delivered order: 409 Conflict", function () {
+        client.assert(response.status === 409, "Expected HTTP 409");
+    });
+%}
+
+### 01.10 Cannot restart a delivered order
+POST {{baseUrl}}/api/orders/{{orderId}}/start-delivery
+Accept: application/json
+
+> {%
+    client.test("Restart delivered order: 409 Conflict", function () {
+        client.assert(response.status === 409, "Expected HTTP 409");
+    });
+%}
+
+### 01.11 Cannot cancel a delivered order
+POST {{baseUrl}}/api/orders/{{orderId}}/cancel
+Accept: application/json
+
+> {%
+    client.test("Cancel delivered order: 409 Conflict", function () {
+        client.assert(response.status === 409, "Expected HTTP 409");
+    });
+%}
+
+
+# =============================================================================
+# 02 | CANCELLATION AND INVALID STATE TRANSITIONS
+# This section uses a SEPARATE newly created order.
+# =============================================================================
+
+### 02.1 Create order for cancellation (saves {{cancelOrderId}})
+POST {{baseUrl}}/api/orders
+Content-Type: application/json
+Accept: application/json
+
+{
+  "description": "DeliveryFlow: cancellation scenario",
+  "price": 1200.00
+}
+
+> {%
+    client.test("Create cancellation order: 201 Created", function () {
+        client.assert(response.status === 201, "Expected HTTP 201");
+        client.assert(!!response.body.id, "Response must include order id");
+    });
+    if (response.status === 201 && response.body.id) {
+        client.global.set("cancelOrderId", response.body.id);
+    }
+%}
+
+### 02.2 Cannot start delivery without an assignment
+POST {{baseUrl}}/api/orders/{{cancelOrderId}}/start-delivery
+Accept: application/json
+
+> {%
+    client.test("Start unassigned order: 409 Conflict", function () {
+        client.assert(response.status === 409, "Expected HTTP 409");
+    });
+%}
+
+### 02.3 Cannot assign a nonexistent courier
+POST {{baseUrl}}/api/orders/{{cancelOrderId}}/assign
+Content-Type: application/json
+Accept: application/json
+
+{
+  "courierId": "{{missingCourierId}}"
+}
+
+> {%
+    client.test("Assign unknown courier: 404 Not Found", function () {
+        client.assert(response.status === 404, "Expected HTTP 404");
+    });
+%}
+
+### 02.4 Cancel an unassigned order
+POST {{baseUrl}}/api/orders/{{cancelOrderId}}/cancel
+Accept: application/json
+
+> {%
+    client.test("Cancel order: successful response", function () {
+        client.assert(response.status === 200 || response.status === 204, "Expected HTTP 200 or 204");
+    });
+%}
+
+### 02.5 Cannot cancel the same order twice
+POST {{baseUrl}}/api/orders/{{cancelOrderId}}/cancel
+Accept: application/json
+
+> {%
+    client.test("Cancel twice: 409 Conflict", function () {
+        client.assert(response.status === 409, "Expected HTTP 409");
+    });
+%}
+
+### 02.6 Cannot assign a cancelled order
+POST {{baseUrl}}/api/orders/{{cancelOrderId}}/assign
+Content-Type: application/json
+Accept: application/json
+
+{
+  "courierId": "{{courierId}}"
+}
+
+> {%
+    client.test("Assign cancelled order: 409 Conflict", function () {
+        client.assert(response.status === 409, "Expected HTTP 409");
+    });
+%}
+
+### 02.7 Cannot complete a cancelled order
+POST {{baseUrl}}/api/orders/{{cancelOrderId}}/complete-delivery
+Accept: application/json
+
+> {%
+    client.test("Complete cancelled order: 409 Conflict", function () {
+        client.assert(response.status === 409, "Expected HTTP 409");
+    });
+%}
+
+
+# =============================================================================
+# 03 | BUSY COURIER AND REUSE AFTER COMPLETING DELIVERY
+# New orders and a new courier keep this scenario independent of section 01.
+# =============================================================================
+
+### 03.1 Create first order for busy-courier scenario
+POST {{baseUrl}}/api/orders
+Content-Type: application/json
+Accept: application/json
+
+{
+  "description": "DeliveryFlow: busy courier - first order",
+  "price": 1750.00
+}
+
+> {%
+    client.test("Create first busy-courier order: 201", function () {
+        client.assert(response.status === 201, "Expected HTTP 201");
+    });
+    if (response.status === 201 && response.body.id) {
+        client.global.set("busyFirstOrderId", response.body.id);
+    }
+%}
+
+### 03.2 Create second order for busy-courier scenario
+POST {{baseUrl}}/api/orders
+Content-Type: application/json
+Accept: application/json
+
+{
+  "description": "DeliveryFlow: busy courier - second order",
+  "price": 1850.00
+}
+
+> {%
+    client.test("Create second busy-courier order: 201", function () {
+        client.assert(response.status === 201, "Expected HTTP 201");
+    });
+    if (response.status === 201 && response.body.id) {
+        client.global.set("busySecondOrderId", response.body.id);
+    }
+%}
+
+### 03.3 Create courier for busy-courier scenario
+POST {{baseUrl}}/api/couriers
+Content-Type: application/json
+Accept: application/json
+
+{
+  "name": "Busy courier test"
+}
+
+> {%
+    client.test("Create busy-courier test courier", function () {
+        client.assert(response.status === 200 || response.status === 201, "Expected HTTP 200 or 201");
+    });
+    if ((response.status === 200 || response.status === 201) && response.body.id) {
+        client.global.set("busyCourierId", response.body.id);
+    }
+%}
+
+### 03.4 Assign courier to first order
+POST {{baseUrl}}/api/orders/{{busyFirstOrderId}}/assign
+Content-Type: application/json
+Accept: application/json
+
+{
+  "courierId": "{{busyCourierId}}"
+}
+
+> {%
+    client.test("First busy-courier assignment: 200 OK", function () {
+        client.assert(response.status === 200, "Expected HTTP 200");
+    });
+%}
+
+### 03.5 Cannot assign busy courier to second order
+POST {{baseUrl}}/api/orders/{{busySecondOrderId}}/assign
+Content-Type: application/json
+Accept: application/json
+
+{
+  "courierId": "{{busyCourierId}}"
+}
+
+> {%
+    client.test("Busy courier: 409 Conflict", function () {
+        client.assert(response.status === 409, "Expected HTTP 409");
+    });
+%}
+
+### 03.6 Cannot assign the first order again
+POST {{baseUrl}}/api/orders/{{busyFirstOrderId}}/assign
+Content-Type: application/json
+Accept: application/json
+
+{
+  "courierId": "{{busyCourierId}}"
+}
+
+> {%
+    client.test("Already assigned order: 409 Conflict", function () {
+        client.assert(response.status === 409, "Expected HTTP 409");
+    });
+%}
+
+### 03.7 Start delivery of first order
+POST {{baseUrl}}/api/orders/{{busyFirstOrderId}}/start-delivery
+Accept: application/json
+
+> {%
+    client.test("Start first order: 200 OK", function () {
+        client.assert(response.status === 200, "Expected HTTP 200");
+    });
+%}
+
+### 03.8 Complete first order, releasing courier
+POST {{baseUrl}}/api/orders/{{busyFirstOrderId}}/complete-delivery
+Accept: application/json
+
+> {%
+    client.test("Finish first order: 200 OK", function () {
+        client.assert(response.status === 200, "Expected HTTP 200");
+    });
+%}
+
+### 03.9 Released courier can be assigned to second order
+POST {{baseUrl}}/api/orders/{{busySecondOrderId}}/assign
+Content-Type: application/json
+Accept: application/json
+
+{
+  "courierId": "{{busyCourierId}}"
+}
+
+> {%
+    client.test("Reuse released courier: 200 OK", function () {
+        client.assert(response.status === 200, "Expected HTTP 200");
+    });
+%}
+
+
+# =============================================================================
+# 04 | VALIDATION, UNKNOWN RESOURCES AND ROUTE CONSTRAINTS
+# No previous variables are required in this section.
+# =============================================================================
+
+### 04.1 Reject zero-price order
+POST {{baseUrl}}/api/orders
+Content-Type: application/json
+Accept: application/json
+
+{
+  "description": "Invalid order: zero price",
+  "price": 0
+}
+
+> {%
+    client.test("Zero price: 400 Bad Request", function () {
+        client.assert(response.status === 400, "Expected HTTP 400");
+    });
+%}
+
+### 04.2 Reject negative-price order
+POST {{baseUrl}}/api/orders
+Content-Type: application/json
+Accept: application/json
+
+{
+  "description": "Invalid order: negative price",
+  "price": -100
+}
+
+> {%
+    client.test("Negative price: 400 Bad Request", function () {
+        client.assert(response.status === 400, "Expected HTTP 400");
+    });
+%}
+
+### 04.3 Reject blank courier name
+POST {{baseUrl}}/api/couriers
+Content-Type: application/json
+Accept: application/json
+
+{
+  "name": "   "
+}
+
+> {%
+    client.test("Blank courier name: 400 Bad Request", function () {
+        client.assert(response.status === 400, "Expected HTTP 400");
+    });
+%}
+
+### 04.4 Get nonexistent order (well-formed GUID)
+GET {{baseUrl}}/api/orders/{{missingOrderId}}
+Accept: application/json
+
+> {%
+    client.test("Unknown order: 404 Not Found", function () {
+        client.assert(response.status === 404, "Expected HTTP 404");
+    });
+%}
+
+### 04.5 Invalid GUID does not match {id:guid} route
+GET {{baseUrl}}/api/orders/not-a-guid
+Accept: application/json
+
+> {%
+    client.test("Invalid GUID route: 404 Not Found", function () {
+        client.assert(response.status === 404, "Expected HTTP 404");
+    });
+%}
+
+### 04.6 Cannot cancel nonexistent order
+POST {{baseUrl}}/api/orders/{{missingOrderId}}/cancel
+Accept: application/json
+
+> {%
+    client.test("Cancel missing order: 404 Not Found", function () {
+        client.assert(response.status === 404, "Expected HTTP 404");
+    });
+%}
+
+### 04.7 Cannot assign courier to nonexistent order
+POST {{baseUrl}}/api/orders/{{missingOrderId}}/assign
+Content-Type: application/json
+Accept: application/json
+
+{
+  "courierId": "{{missingCourierId}}"
+}
+
+> {%
+    client.test("Assign missing order: 404 Not Found", function () {
+        client.assert(response.status === 404, "Expected HTTP 404");
+    });
+%}
+
+### 04.8 Cannot start nonexistent order
+POST {{baseUrl}}/api/orders/{{missingOrderId}}/start-delivery
+Accept: application/json
+
+> {%
+    client.test("Start missing order: 404 Not Found", function () {
+        client.assert(response.status === 404, "Expected HTTP 404");
+    });
+%}
+
+### 04.9 Cannot complete nonexistent order
+POST {{baseUrl}}/api/orders/{{missingOrderId}}/complete-delivery
+Accept: application/json
+
+> {%
+    client.test("Complete missing order: 404 Not Found", function () {
+        client.assert(response.status === 404, "Expected HTTP 404");
+    });
+%}

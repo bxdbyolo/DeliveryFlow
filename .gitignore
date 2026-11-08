@@ -1,0 +1,23 @@
+# Local configuration
+.env
+.env.*
+!.env.example
+
+# .NET build artifacts
+**/bin/
+**/obj/
+**/TestResults/
+
+# IDE
+# Rider
+.idea/
+*.iml
+*.DotSettings.user
+/_ReSharper.Caches/
+
+# VSCode
+.vs/
+.vscode/
+
+# System
+.DS_Store
